@@ -1,0 +1,60 @@
+## **TensorFlow RDMA 源码剖析——概述**
+
+## **如何编译和使用RDMA版的TensorFlow** 
+
+1. 使用往常的 TF 编译指令进行编译。 在配置阶段, 如果你想要基于 ibverbs 的 RDMA 支持, 下面这个问题回答yes:
+
+    ```Do you wish to build TensorFlow with VERBS-RDMA support [y/N]```
+
+2. 为了转为 RDMA 连接, 在 server 定义的时候增加协议 "grpc+verbs" :
+
+    ```server = tf.train.Server(cluster, job_name="local", task_index=0, protocol='grpc+verbs') # default protocol is 'grpc'```
+
+## **综述** 
+设个设计实现是基于 TensorFlow r1.0. servers之间添加一个RDMA path用于tensor传输 (weights, gradients等)。原有的GRPC path依然保留，GRPC path负责一些管理任务，比如设置RDMA path，交换计算图等 。
+
+在server的配置期间，一个RDMA manager被创建，RDMA manager用于管理低级别的RDMA组件，比如RDMA channel 和 RDMA adapter，一个RDMA rendezvous manager 用于监督 servers之间的 send/recv 操作 。 我们的设计遵循分布式 TensorFlow 的设计理念,  send 操作是被动的, 它仅仅将一个tensor放入到local out-going 表中。 receive 操作 才是真正的启动 tensor 的传输。
+
+
+当一个tensor准备进行传输，它先会被转化为TensorProto格式，然后这个proto被序列化为byte数组，拷贝到绑定的buffer中。buffer中的内容将会通过RDMA write传输到远程节点。对于远程节点，处理的流程正好相反。尽管原始的tensor是存放在device上的，TensorProto是存在在host memory上的，所有的绑定buffer都在host  memory中被分配（MXnet 中的实现也是如此，看一下是否可以直接GPU to GPU？？）。
+
+
+## **设计细节** 
+
+### **1、RDMA 组件**
+
+* **RDMA adapter:** 用于 RDMA 通信. 它包含多个 channels 和 buffers.  adapter负责处理不同的RDMA messages。
+* **RDMA channel:** Responsible for RDMA connection to a particular node. channel管理多个 buffers. 一个 channel 有一个 callback table ，这个表用于存放所有的请求tensor的callback函数。
+* **RDMA buffer:** 负责发送和接受数据。它有固定大小的memory来存储数据。它有一个队列来存放排队的jobs。有三种类型的buffers, 分别是message buffer, ACK buffer 和 tensor buffer。一个 channel 有两个message buffers, 两个ack buffers 和很多 tensor buffers.
+* **RDMA manager:** 管理 adapter 和 channels, 包括 channel 创建, channel 设置（通过GRPC服务）, channel 查询, 等.
+* **RDMA rendezvous manager:** 管理多个 rdma rendezvous。
+* **RDMA rendezvous:** BaseRemoteRendezvous 的派生类。 这个类是 "send" 和 "recv" 算子的背后实现。当 sendrecv_op 算子想要 send 或 receive 一个tensor, 它会分别调用 rendezvous的 "send" and "recv" 函数. Rendezvous 通过"step_id"来识别, step_id是一个随机数, 因此不同迭代的tensor不会被混淆。
+
+### **2、SEND 操作  （rendezvous的 "send"）** 
+
+在TensorFlow中, 当rendezvous 发送一个 tensor, 它仅仅是把tensor放在local表中。如果这个tensor被请求，一个callback存在于表中。 "send" 将会激活这个 callback, 这个callback将会完成跨节点传送tensor。 
+
+
+### **3、RECV 操作   （rendezvous的 "recv"）** 
+
+当一个tensor被请求，rendezvous的 recv函数被调用. 这个函数首先在channel的回调函数表中放置一个callback函数，一旦一个tensor从source端发送过来，这个函数将会被激活，下一步，一个message被发送到请求tensor的source端（通知source端），一旦source端收到了这个message，它将会在locally查找这个tensor，如果没有找到，一个callback函数将会放入表中，否则，这个tensor id将会被放置到相应的RDMA buffer的job队列中，用于将来的传输。 当一个tensor准备好打算开始调度，远程节点的RDMA buffer需要memory分配和初始化。如果memory没有准备好，传输将会被延后，一个message将会被发往目的地来开辟内存。另一种传输延后的情况是当buffer处于buzzy状态（正在进行传输）。
+
+### **4、RDMA buffers有三种类型** 
+
+* **Message buffer:** 负责发送 message 。
+* **Ack buffer:** 一旦一个message被发送，message的接收方需要通过ack buffer发送一个ack来释放发送方的message buffer。一个ack buffer和唯一的message buffer绑定。
+* **Tensor buffer:** 负责发送tensor, tensor的接收方需要返回一个message来释放发送方的buffer。
+
+### **5、RDMA message格式** 
+
+| type | name_size | name | step_id | buffer_size | remote_addr | rkey | is_dead | data_type | tensor_shape | tensor_bytes | tensor_buffer |
+| ---- | --------- | ---- | ------- | ----------- | ----------- | ---- | ------- | --------- | ------------ | ------------ | ------------- |
+|      |           |      |         |             |             |      |         |           |              |              |               |
+
+### **6、RDMA messages 的6种类型**  
+* RDMA_MESSAGE_ACK
+* RDMA_MESSAGE_BUFFER_IDLE
+* RDMA_MESSAGE_BUFFER_REQUEST
+* RDMA_MESSAGE_BUFFER_RESPONSE
+* RDMA_MESSAGE_TENSOR_REQUEST
+* RDMA_MESSAGE_TENSOR_WRITE

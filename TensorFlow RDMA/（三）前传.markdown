@@ -1,0 +1,336 @@
+## **TensorFlow RDMA 源码剖析——前传**
+
+## **前言**
+
+TensorFlow1.2之前，TensorFlow的分布式使用grpc方式来实现，grpc通信方式会导致多次用户态和内核态之间的切换，发送方需要把数据从应用内存拷贝到内核内存，然后传输给接收方，接收方同样需要经过内核内存才能最终获得数据，这就造成了大量的内存带宽和CPU消耗。
+
+而RDMA可以通过网络把资料直接传入计算机的存储区，将数据从一个系统快速移动到远程系统存储器中，而不对操作系统造成任何影响，这样就不需要用到多少计算机的处理功能。它消除了外部存储器复制和文本交换操作，因而能解放内存带宽和CPU周期用于改进应用系统性能。RDMA采用零拷贝网络技术，使NIC 可以直接与应用内存相互传输数据，从而消除了在应用内存与内核内存之间复制数据的需要.	内核内存旁路使应用无需执行内核内存调用就可向NIC 发送命令.	在不需要任何内核内存参与的条件下， RDMA 请求从用户空间发送到本地NIC，并通过网络发送给远程NIC ，这就减少了在处理网络传输流时内核内存空间与用户空间之间环境切换的次数。
+
+因此，利用RDMA技术可以大大提高计算机系统性能，降低节点间传输数据所需要的延时。在最近的TensorFlow1.2版本中，雅虎公司贡献了RDMA部分的代码，接下来，我们开始进入正题——源码剖析。
+
+## **Distributed TensorFlow**
+
+故事还要从TensorFlow的分布式讲起，下面一段代码是TensorFlow官网给出的Distributed TensorFlow教程。
+
+```python
+import argparse
+import sys
+import tensorflow as tf
+FLAGS = None
+
+def main(_):
+  ps_hosts = FLAGS.ps_hosts.split(",")
+  worker_hosts = FLAGS.worker_hosts.split(",")
+  # Create a cluster from the parameter server and worker hosts.
+  cluster = tf.train.ClusterSpec({"ps": ps_hosts, "worker": worker_hosts})
+  # Create and start a server for the local task.
+  server = tf.train.Server(cluster,
+                           job_name=FLAGS.job_name,
+                           task_index=FLAGS.task_index)
+
+  if FLAGS.job_name == "ps":
+    server.join()
+  elif FLAGS.job_name == "worker":
+    # Assigns ops to the local worker by default.
+    with tf.device(tf.train.replica_device_setter(
+        worker_device="/job:worker/task:%d" % FLAGS.task_index,
+        cluster=cluster)):
+      # Build model...
+      loss = ...
+      global_step = tf.contrib.framework.get_or_create_global_step()
+      train_op = tf.train.AdagradOptimizer(0.01).minimize(
+          loss, global_step=global_step)
+    hooks=[tf.train.StopAtStepHook(last_step=1000000)]
+
+    with tf.train.MonitoredTrainingSession(master=server.target,
+                                           is_chief=(FLAGS.task_index == 0),
+                                           checkpoint_dir="/tmp/train_logs",
+                                           hooks=hooks) as mon_sess:
+      while not mon_sess.should_stop():
+        mon_sess.run(train_op)
+```
+
+这段代码和单机版的代码一样，都是先构建一个graph，然后定义损失和梯度等，最后在session中完成训练。唯一的不同是，定义了
+
+```python
+server = tf.train.Server(cluster,
+                           job_name=FLAGS.job_name,
+                           task_index=FLAGS.task_index)
+```
+
+tf.train.Server 封装了一组设备和tf.session，使用Server可以实现分布式训练，同一个 cluster中的Server可以进行通信。这行代码其实默认了一个参数，更为完整的应该是
+
+```python
+server = tf.train.Server(cluster,
+                           job_name=FLAGS.job_name,
+                           task_index=FLAGS.task_index,
+                           protocol='grpc')
+```
+
+这里多了一个叫做protocol的参数，这个参数指定了server采用grpc协议进行通信。而如果我们想使用RDMA进行通信的话需要指定
+
+```python
+server = tf.train.Server(cluster,
+                           job_name=FLAGS.job_name,
+                           task_index=FLAGS.task_index,
+                           protocol='grpc+verbs')
+```
+
+TensorFlow RDMA可以化为两个部分，其中一个部分就隐藏在这行代码之后。在Python端，tf.train.Server只是定义了计算图中的一个算子，当图通过session提交给后端master后，graph开始执行，server会进行初始化操作，server设置阶段，会调用GrpcServer类完成初始化、开启服务等操作，GrpcServer是ServerInterface的派生类，ServerInterface是一个接口类，声明了start（），stop（），join（）等接口，start用于开启service（服务），stop用于终止服务，join会阻塞直到server结束。而GrpcServer将这些接口具体实现，同时实现init（），这个init会根据客户端定义的cluster列表完成server初始化，在这之后server就有了cluster中个节点的IP、port信息，可以进行相应的grpc通信了。
+
+![img](http://www.literacystudies.com/src2/tensorflow/core/classtensorflow_1_1_server_interface.png)
+
+GrpcServer的状态转换图如下
+
+![pic5](http://git.code.oa.com/paichen/TensorFlow-source/raw/master/TensorFlow%20RDMA/pic/pic5.png)
+
+```python
+tf.train.ClusterSpec({    (cluster列表)
+    "worker": [
+        "worker0.example.com:2222",
+        "worker1.example.com:2222",
+        "worker2.example.com:2222"
+    ],
+    "ps": [
+        "ps0.example.com:2222",
+        "ps1.example.com:2222"
+    ]})
+```
+
+## **verbs_server_lib.h**
+
+到这里，我们了解了TensorFlow基于传统的gRPC是如何工作的。接下来我们介绍TensorFlow基于RDMA的工作原理，对于RDMA，server初始化时会调用verbs_server_lib.h中的class VerbsServer，VerbsServer是GrpcServer的派生类，同样是实现ServerInterface中的接口函数以及init函数。
+
+- VerbsServer数据成员：
+
+```cpp
+  RdmaMgr* rdma_mgr_;
+  // Guards state transitions.
+  mutex mu_;
+  GrpcVerbsService* verbs_service_ = nullptr;
+  std::unique_ptr<Thread> verbs_thread_ GUARDED_BY(mu_);
+  GrpcChannelCache* channel_cache_ = nullptr;
+```
+
+- VerbsServer函数成员：
+
+```cpp
+  static Status Create(const ServerDef& server_def, Env* env,
+                       std::unique_ptr<ServerInterface>* out_server);
+  // Implementations of ServerInterface methods.
+  Status Start() override;
+  Status Join() override;
+ protected:
+  Status Init(ServiceInitFunction service_func,
+              RendezvousMgrCreationFunction rendezvous_mgr_func);
+  Status ChannelCacheFactory(const ServerDef& server_def,
+                             GrpcChannelCache** channel_cache);
+```
+
+Init()中调用GrpcServer::Init完成grpc协议的初始化，这样server有了集群中各个节点的地址信息，可以进行grpc调用，然后创建了一个RdmaMgr（RdmaMgr用于管理RDMA的channels和adapter，关于RdmaMgr详情可参考相应章节），并为verbs_service和rdma_rendezvous_mgr设置RdmaMgr。
+
+```cpp
+Status VerbsServer::Init(ServiceInitFunction service_func,
+                         RendezvousMgrCreationFunction rendezvous_mgr_func) {
+  Status s = GrpcServer::Init(service_func, rendezvous_mgr_func);
+  {
+    mutex_lock l(mu_);
+    CHECK_EQ(verbs_state_, DISCONNECTED);
+    CHECK(ChannelCacheFactory(server_def(), &channel_cache_).ok());
+    rdma_mgr_ = new RdmaMgr(worker_env(), channel_cache_);
+    // set rdma_mgr for verbs_service and rdma_rendezvous_mgr
+    verbs_service_->SetRdmaMgr(rdma_mgr_);
+    dynamic_cast<RdmaRendezvousMgr*>(worker_env()->rendezvous_mgr)
+        ->SetRdmaMgr(rdma_mgr_);
+  }
+  return s;
+}
+```
+
+Start()中调用GrpcServer::Start()开启grpc的服务，然后初始化verbs_thread_线程，使其开启verb service 服务，最后调用rdma_mgr的SetupChannels()来完成RDMA channel的初始化。相信此时您已经是一头雾水，没关系，听我慢慢道来。首先，这段代码还是倒过来看比较好，SetupChannels是干什么的呢？你迫切的想要使用RDMA的心情我可以理解，但是RDMA要想工作也得做一些准备工作吧！RDAM 使用RDMA channel来完成端到端的通信，而通信得需要地址吧，最最开始的时候，RDMA channel根本不知道其它节点的地址啊，这个SetupChannels就是完成RDMA channel的初始化，它通过gRPC来获得远程端的地址，而想进行GRPC调用就需要server端开启相应的服务（返回地址给client），而verbs_thread做的就是开启一个线程实现“返回地址信息“的服务，HandleRPCsLoop就是服务的具体实现。至此start就介绍完了，这个非常关键，**示意图和流程图见下图**  。
+
+```cpp
+Status VerbsServer::Start() {
+  Status s = GrpcServer::Start();
+  {
+    mutex_lock l(mu_);
+    if (verbs_state_ == DISCONNECTED) {
+      // verbs_thread needs to be initiated
+      // before rdma_mgr sets up the rdma channels.
+      verbs_thread_.reset(worker_env()->env->StartThread(
+          ThreadOptions(), "TF_verbs_service",
+          [this] { verbs_service_->HandleRPCsLoop(); }));
+      rdma_mgr_->SetupChannels();
+      verbs_state_ = CONNECTED;
+    }
+  }
+  return s;
+}
+```
+
+
+
+![img](http://git.code.oa.com/paichen/TensorFlow-source/raw/master/TensorFlow%20RDMA/pic/pic4.png)
+
+
+
+## **grpc_verbs_service.h**
+
+前文说道RdmaMgr通过调用gRPC服务来初始化RDMA channel，使RDMA channel拥有远程节点的地址信息，而grpc_verbs_service.h中的class GrpcVerbsService就定义了这个服务的具体实现。
+
+- GrpcVerbsService的数据成员
+
+```cpp
+  ::grpc::ServerCompletionQueue* cq_;
+  grpc::VerbsService::AsyncService verbs_service_;
+  mutex shutdown_mu_;
+  bool is_shutdown_ GUARDED_BY(shutdown_mu_);
+  ::grpc::Alarm* shutdown_alarm_;
+  // not owned
+  RdmaMgr* rdma_mgr_;
+  const WorkerEnv* const worker_env_;
+```
+
+- GrpcVerbsService的函数成员
+
+```cpp
+  void HandleRPCsLoop() override;
+  void Shutdown() override;
+  void SetRdmaMgr(RdmaMgr* rdma_mgr) { rdma_mgr_ = rdma_mgr; }
+ private:
+  template <class RequestMessage, class ResponseMessage>
+  using WorkerCall = Call<GrpcVerbsService, grpc::VerbsService::AsyncService,
+                          RequestMessage, ResponseMessage>;
+  void GetRemoteAddressHandler(
+      WorkerCall<GetRemoteAddressRequest, GetRemoteAddressResponse>* call);
+  Status GetRemoteAddressSync(const GetRemoteAddressRequest* request,
+                              GetRemoteAddressResponse* response);
+```
+
+上节提到VerbsServer::Start调用HandleRPCsLoop来开启服务
+
+```cpp
+void GrpcVerbsService::HandleRPCsLoop() {
+  for (int i = 0; i < 10; ++i) {
+    ENQUEUE_REQUEST(GetRemoteAddress, false);
+  }
+  void* tag;
+  bool ok;
+  while (cq_->Next(&tag, &ok)) {
+    UntypedCall<GrpcVerbsService>::Tag* callback_tag =
+        static_cast<UntypedCall<GrpcVerbsService>::Tag*>(tag);
+    if (callback_tag) {
+      callback_tag->OnCompleted(this, ok);
+    } else {
+      cq_->Shutdown();
+    }
+  }
+}
+```
+
+HandleRPCsLoop调用宏ENQUEUE_REQUEST，宏ENQUEUE_REQUEST调用GetRemoteAddressHandler，GetRemoteAddressHandler调用GetRemoteAddressSync，GetRemoteAddressSync是服务的具体实现，client希望获得server的地址信息，GetRemoteAddressSync把server的地址以及RDMA channel中各buffer的地址、key信息通过GetRemoteAddressResponse发送给client，至此client获得了远程节点的地址信息，可以进行channel初始化以及愉快的进行RDMA数据传输了。
+
+```cpp
+Status GrpcVerbsService::GetRemoteAddressSync(
+    const GetRemoteAddressRequest* request,
+    GetRemoteAddressResponse* response) {
+  // analyzing request
+  // the channel setting part is redundant.
+  const string remote_host_name = request->host_name();
+  RdmaChannel* rc = rdma_mgr_->FindChannel(remote_host_name);
+  CHECK(rc);
+  RdmaAddress ra;
+  ra.lid = request->channel().lid();
+  ...
+  rc->SetRemoteAddress(ra, false);
+  rc->Connect();
+  int i = 0;
+  int idx[] = {1, 0, 3, 2};
+  std::vector<RdmaBuffer*> mb(rc->message_buffers());
+  CHECK_EQ(request->mr_size(), 4);
+  for (const auto& mr : request->mr()) {
+    // hence idx[] = {1, 0, 3, 2}.
+    RdmaBuffer* rb = mb[idx[i]];
+    RemoteMR rmr;
+    rmr.remote_addr = mr.remote_addr();
+    rmr.rkey = mr.rkey();
+    rb->SetRemoteMR(rmr, false);
+    i++;
+  }
+  CHECK(i == RdmaChannel::kNumMessageBuffers);
+  // setting up response
+  response->set_host_name(
+      worker_env_->session_mgr->LegacySession()->worker_name);
+  Channel* channel_info = response->mutable_channel();
+  channel_info->set_lid(rc->self().lid);
+  ...
+  for (int i = 0; i < RdmaChannel::kNumMessageBuffers; i++) {
+    MemoryRegion* mr = response->add_mr();
+    mr->set_remote_addr(reinterpret_cast<uint64>(mb[i]->buffer()));
+    mr->set_rkey(mb[i]->self()->rkey);
+  }
+  return Status::OK();
+}
+```
+
+## **grpc_verbs_service_impl.h**
+
+client想要获得远程节点的地址，就需要调用gRPC，远程节点的server会通过相应的服务将地址信息返回给client。但是，这个gRPC协议是怎样定义的呢，如何实现client的gRPC调用呢。这个就是grpc_verbs_service_impl.h中class VerbsService GRPC_FINAL 完成的任务啦。VerbsService基于//tensorflow/contrib/verbs/verbs_service.proto文件实现了tensorflow.VerbsService，
+
+```cpp
+class VerbsService GRPC_FINAL {   // GPRC同步调用
+ public:
+  class StubInterface {
+   public:
+    virtual ~StubInterface() {}
+    virtual ::grpc::Status GetRemoteAddress(
+        ::grpc::ClientContext* context, const GetRemoteAddressRequest& request,
+        GetRemoteAddressResponse* response) = 0;
+  };
+  class Stub GRPC_FINAL : public StubInterface {
+   public:
+    Stub(const std::shared_ptr< ::grpc::ChannelInterface>& channel);
+    ::grpc::Status GetRemoteAddress(
+        ::grpc::ClientContext* context, const GetRemoteAddressRequest& request,
+        GetRemoteAddressResponse* response) GRPC_OVERRIDE;
+   private:
+    std::shared_ptr< ::grpc::ChannelInterface> channel_;
+    const ::grpc::RpcMethod rpcmethod_GetRemoteAddress_;
+  };
+  static std::unique_ptr<Stub> NewStub(
+      const std::shared_ptr< ::grpc::ChannelInterface>& channel,
+      const ::grpc::StubOptions& options = ::grpc::StubOptions());
+  class AsyncService : public ::grpc::Service {
+   public:
+    AsyncService();
+    virtual ~AsyncService();
+    void RequestGetRemoteAddress(
+        ::grpc::ServerContext* context, GetRemoteAddressRequest* request,
+        ::grpc::ServerAsyncResponseWriter<GetRemoteAddressResponse>* response,
+        ::grpc::CompletionQueue* new_call_cq,
+        ::grpc::ServerCompletionQueue* notification_cq, void* tag) {
+      ::grpc::Service::RequestAsyncUnary(0, context, request, response,
+                                         new_call_cq, notification_cq, tag);
+    }
+  };
+};
+```
+
+整个实现与通常的GPRC调用没什么两样，如果你不熟悉GPRC调用可以参考下面这个链接
+
+[GPRC同步调用分析](https://www.sailsxu.com/?p=608#2)
+
+## **总结**
+
+​	以上就是TensorFlow RDMA两部曲的第一部分，它们隐藏在tf.train.Server的背后，处于RDMA传输的准备阶段，完成RDMAMgr和RDMA channel的初始化，使第二部分的send和recv算子可以互相通信。
+
+
+
+
+
+
+
+
+
+
+

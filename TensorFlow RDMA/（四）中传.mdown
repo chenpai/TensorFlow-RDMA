@@ -1,0 +1,440 @@
+## **TensorFlow RDMA 源码剖析——中传** 
+
+## **前言**
+
+在“TensorFlow RDMA 源码剖析——前传”中我们剖析了TensorFlow RDMA的初始化工作，RDMA使用gRPC调用来获得远程端的地址以及相应buffer的内存地址和key，在这之后，RDMA channel就拥有了集群各节点的地址信息，可以进行消息通信和数据（tensor）传输了。那么TensorFlow如何使用RDMA进行通信呢，这就是这部分要介绍的内容了。
+
+我们都知道TensorFlow的执行其实就是数据流图的执行，单机的图执行没什么好说的，就是根据节点间的依赖关系来执行，对于分布式来说，图和图之间是如何通信的呢？ TensorFlow会在需要通信的节点路径上添加send和recv算子，send算子用于发送tensor，而recv算子用于接收算子，这两个算子封装了通信的实现。如下图所示，send 操作是被动的, 它仅仅将一个tensor放入到local out-going 表中。 receive 操作 才是真正的启动 tensor 的传输。
+
+![img](http://git.code.oa.com/paichen/TensorFlow-source/raw/master/TensorFlow%20RDMA/pic/pic1.png)
+
+当一个tensor准备进行传输，它先会被转化为TensorProto格式，然后这个proto被序列化为byte数组，拷贝到绑定的buffer中。buffer中的内容将会通过RDMA write传输到远程节点。对于远程节点，处理的流程正好相反。尽管原始的tensor是存放在device上的，TensorProto是存在在host memory上的，所有的绑定buffer都在host memory中被分配。
+
+TensorFlow 使用RDMA进行消息、数据通信涉及如下几个文件** 
+
+- rdma.h	rdma.cc
+- rdma_mgr.h   rdma_mgr.cc
+- rdma_rendezvous_mgr.h   rdma_rendezvous_mgr.cc
+- verbs_util.h   verbs_util.cc
+
+
+TensorFlow RDMA的基本组件包括 **RDMA adapter**、**RDMA channel**、**RDMA buffer**、**RDMA manager**、**RDMA rendezvous manager**、**RDMA rendezvous**等，对于这几个组件的介绍可以点击链接查看[**（一）概述**](http://git.code.oa.com/paichen/TensorFlow-source/blob/master/TensorFlow%20RDMA/%EF%BC%88%E4%B8%80%EF%BC%89%E6%A6%82%E8%BF%B0.mdown) 部分。
+
+## **rdma.h  rdma.cc**    
+
+- ### **class RdmaAdapter** 
+
+  - 数据成员：
+
+    ```cpp
+      ibv_context* context_;
+      // ibverbs protection domain
+      ibv_pd* pd_;
+      // Completion event channel, to wait for work completions
+      ibv_comp_channel* event_channel_;
+      // Completion queue, to poll on work completions
+      ibv_cq* cq_;
+      // Pre-allocated work completions array used for polling
+      ibv_wc wc_[MAX_CONCURRENT_WRITES * 2];
+      // worker env for thread
+      const WorkerEnv* worker_env_;
+      // thread for cq.
+      std::unique_ptr<Thread> polling_thread_;
+    ```
+
+  - 函数成员：
+
+    ```cpp
+    void Process_CQ();
+    ```
+
+  RdmaAdapter负责处理不同的RDMA messages请求，它会使用ibv_comp_channel监听完成的事件，将完成的事件加入到ibv_cq完成队列之中，然后轮询处理完成的事件。其中ibv_comp_channel和ibv_cq都是很重要的RDMA API，详细的可以参考这个链接[RDMA Aware Networks Programming.pdf](http://git.code.oa.com/paichen/TensorFlow-source/blob/master/TensorFlow%20RDMA/RDMA%20Aware%20Networks%20Programming.pdf)。 Process_CQ()就定义了RDMA如何处理这些事件
+
+  ```cpp
+  // Function to process incoming messages
+  void RdmaAdapter::Process_CQ() {
+    while (true) {
+      ibv_cq* cq;
+      void* cq_context;
+      CHECK(!ibv_get_cq_event(event_channel_, &cq, &cq_context));
+      CHECK(cq == cq_);
+      ibv_ack_cq_events(cq, 1);
+      CHECK(!ibv_req_notify_cq(cq_, 0));
+      int ne =
+          ibv_poll_cq(cq_, MAX_CONCURRENT_WRITES * 2, static_cast<ibv_wc*>(wc_));   
+      CHECK_GE(ne, 0);
+      for (int i = 0; i < ne; ++i) {
+        if (wc_[i].opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+          RdmaChannel* rc = reinterpret_cast<RdmaChannel*>(wc_[i].wr_id); 
+          // put back a recv wr.
+          rc->Recv();
+          // imm_data is the index of RX buffer in the buffer table.
+          uint32_t imm_data = wc_[i].imm_data;
+          RdmaBuffer* rb = rc->FindBuffer(imm_data);
+          RdmaMessage rm;
+          RdmaMessage::ParseMessage(rm, rb->buffer_);
+          VLOG(2) << "recv RDMA message: " << MessageTypeToString(rm.type_);
+          if (rm.type_ == RDMA_MESSAGE_ACK) {
+            .....
+          } else if (rm.type_ == RDMA_MESSAGE_TENSOR_REQUEST) {
+            .....
+          } else if (rm.type_ == RDMA_MESSAGE_BUFFER_IDLE) {
+            .....
+          } else if (rm.type_ == RDMA_MESSAGE_BUFFER_REQUEST) {
+            .....
+          } else if (rm.type_ == RDMA_MESSAGE_BUFFER_RESPONSE) {
+            .....
+          } else if (rm.type_ == RDMA_MESSAGE_TENSOR_WRITE) {
+            .....
+          }
+        } else if (wc_[i].opcode == IBV_WC_RDMA_WRITE) {
+  		  .....
+        }
+      }
+    }
+  }
+  ```
+
+  具体的处理流程描述如下图：
+
+  ![img](http://git.code.oa.com/paichen/TensorFlow-source/raw/master/TensorFlow%20RDMA/pic/pic2.png)
+
+
+
+- ### **class RdmaChannel** 
+
+  - 数据成员：
+
+    ```cpp
+      const RdmaAdapter* adapter_;
+      RdmaAddress self_;
+      string local_name_;
+      string remote_name_;
+      ibv_qp* qp_;
+      mutex mu_;
+      bool connected_ GUARDED_BY(bt_mu_) = false;
+      RdmaAddress remote_ GUARDED_BY(bt_mu_);
+      bool remote_set_ GUARDED_BY(bt_mu_) = false;
+      mutex ct_mu_;
+      typedef std::unordered_map<string, std::function<void()> > CallbackTable;
+      CallbackTable callback_table_ GUARDED_BY(ct_mu_);
+      mutex bt_mu_;
+      typedef std::unordered_map<unsigned int, RdmaBuffer*> BufferTable;
+      BufferTable buffer_table_ GUARDED_BY(bt_mu_);
+      typedef std::unordered_map<uint32_t, string> BufferIndexNameTable;
+      BufferIndexNameTable buffer_index_name_table_ GUARDED_BY(bt_mu_);
+      typedef std::unordered_map<string, uint32_t> BufferNameIndexTable;
+      BufferNameIndexTable buffer_name_index_table_ GUARDED_BY(bt_mu_);
+      RdmaBuffer* tx_message_buffer_;
+      RdmaBuffer* rx_message_buffer_;
+      RdmaBuffer* tx_ack_buffer_;
+      RdmaBuffer* rx_ack_buffer_;
+      std::vector<RdmaBuffer*> message_buffers_;
+    ```
+
+  - 函数成员：
+
+    ```cpp
+      void Connect(const RdmaAddress& remoteAddr);
+      void Connect();
+      void Recv();
+      RdmaBuffer* FindBuffer(const uint32_t index);
+      RdmaBuffer* FindBuffer(const string& name);
+      RdmaBuffer* FindOrCreateBuffer(const string& name,
+                                     BufferType buffer_type = TENSOR);
+      uint32_t LookupBufferIndex(const string& buffer_name);
+      void SetRemoteAddress(const RdmaAddress& ra, bool override);
+      void InsertRecvCallback(const string& key, std::function<void()> recv_done);
+      void RemoveRecvCallback(const string& key);
+      void RunRecvCallback(const string& key);
+    ```
+
+    RdmaChannel负责端到端的通信，RdmaChannel拥有ibv_qp（RDMA API）来实现RDMA通信，拥有远程端的地址，还拥有两个ack buffer、两个message buffer、多个tensor buffer。Connect（）用于建立到远程端的连接，Recv（）调用ibv_post_recv来实现RDMA接收消息，FindBuffer（）用于根据索引或名字找到相应的buffer，FindOrCreateBuffer（）用于根据参数type创建相应的buffer（type可以使ack、message、tensor），InsertRecvCallback（）会将callback函数放入callback表中，当Recv端接收到tensor后，会调用这个callback函数（RunRecvCallback）。
+
+    ```cpp
+    // Adding tokens to the completion queue
+    // Tokens are needed to process future messages.
+    void RdmaChannel::Recv() {
+      struct ibv_recv_wr wr;
+      memset(&wr, 0, sizeof(wr));
+      wr.wr_id = (uint64_t)this;
+      struct ibv_recv_wr* bad_wr;
+      CHECK(!ibv_post_recv(qp_, &wr, &bad_wr)) << "Failed to post recv";
+    }
+    ```
+
+- ### **class RdmaBuffer**
+
+
+  - 数据成员：
+
+  ```cpp
+    const RdmaChannel* channel_;
+    void* buffer_ = nullptr;
+    bool buffer_on_host_ = true;
+    size_t size_ = 0;
+    const string name_;
+    ibv_mr* self_ = nullptr;
+    mutex mu_;
+    RemoteMR remote_;
+    std::queue<string> queue_ GUARDED_BY(mu_);
+    BufferStatus local_status_ GUARDED_BY(mu_) = none;
+    BufferStatus remote_status_ GUARDED_BY(mu_) = none;
+  ```
+
+
+  - 函数成员：
+
+  ```cpp
+    void FreeBuffer();
+    void EnqueueItem(string Item);
+    virtual void SendNextItem(){};
+    void CreateCPUBuffer(size_t size, bool lock = true);
+    void SetRemoteMR(RemoteMR rmi, bool override);
+    uint32_t LookupBufferIndex(const string& buffer_name) ;
+    void Write(uint32_t imm_data, size_t buffer_size);
+  ```
+
+  RdmaBuffer表示用于RDMA读和写的buffer，RdmaBuffer有三个派生类，分别是RdmaAckBuffer、RdmaMessageBuffer和RdmaTensorBuffer，RdmaMessageBuffer负责发送 message ，比如请求一个tensor等等。一旦一个message被发送，message的接收方需要通过RdmaAckBuffer发送一个ack来释放发送方的message buffer。一个RdmaAckBuffer和唯一的RdmaMessageBuffer绑定。RdmaTensorBuffer负责发送tensor，tensor的接收方需要返回一个message来释放发送方的buffer。
+
+  Write函数通过调用RDMA api完成Rdma-Write，将buffer中的内容通过RDMA写入远程节点
+
+  ```cpp
+  void RdmaBuffer::Write(uint32_t imm_data, size_t buffer_size) {
+    struct ibv_sge list;
+    list.addr = (uint64_t)buffer_;
+    list.length = buffer_size;
+    list.lkey = self_->lkey;
+    //An SR(send request) defines how much data will be sent, from where, how and, with RDMA, to where.
+    //struct ibv_send_wr is used to implement SRs.
+    struct ibv_send_wr wr;
+    memset(&wr, 0, sizeof(wr));
+    wr.wr_id = (uint64_t)this;
+    wr.sg_list = &list;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.imm_data = imm_data;
+    wr.wr.rdma.remote_addr = (uint64_t)remote_.remote_addr;
+    wr.wr.rdma.rkey = remote_.rkey;
+    struct ibv_send_wr* bad_wr;
+    CHECK(!ibv_post_send(channel_->qp_, &wr, &bad_wr)) << "Failed to post send";
+  }
+  ```
+
+  CreateCPUBuffer函数在CPU内存开辟空间来存放相应类型的buffer，目前版本只支持buffer on CPU，不支持RDMABuffer on device，处于TODO阶段。
+
+  三种buffer的区别在于SendNextItem函数的实现上，RdmaAckBuffe的SendNextItem会创建一个name为rx_ack_buffer，type为RDMA_MESSAGE_ACK的message，然后通过write函数完成RDMA写。RdmaMessageBuffer的SendNextItem会将本地节点和远程节点状态设置为繁忙，然后从buffer的事件队列中取出队列头message，通过write函数完成RDMA写。RdmaTensorBuffer的SendNextItem： TODO
+
+  ```
+  void RdmaTensorBuffer::SendNextItem() {
+    //TODO
+    ......
+  }
+  ```
+
+  ​
+
+
+- ### struct RdmaMessage
+
+RDMA message格式
+
+| type | name_size | name | step_id | buffer_size | remote_addr | rkey | is_dead | data_type | tensor_shape | tensor_bytes | tensor_buffer |
+| ---- | --------- | ---- | ------- | ----------- | ----------- | ---- | ------- | --------- | ------------ | ------------ | ------------- |
+|      |           |      |         |             |             |      |         |           |              |              |               |
+
+RDMA messages 的6种类型
+
+- RDMA_MESSAGE_ACK
+
+
+- RDMA_MESSAGE_BUFFER_IDLE
+- RDMA_MESSAGE_BUFFER_REQUEST
+- RDMA_MESSAGE_BUFFER_RESPONSE
+- RDMA_MESSAGE_TENSOR_REQUEST
+- RDMA_MESSAGE_TENSOR_WRITE
+
+
+
+
+
+## **rdma_mgr.h rdma_mgr.cc** 
+
+- ### **class RdmaMgr**
+
+  - 数据成员
+
+    ```cpp
+      string local_worker_;
+      size_t num_remote_workers_;
+      const WorkerEnv* const worker_env_;
+      GrpcChannelCache* const channel_cache_;
+      RdmaAdapter* rdma_adapter_;
+      typedef std::unordered_map<string, RdmaChannel*> ChannelTable;
+      ChannelTable channel_table_;
+    ```
+
+    ​
+
+  - 函数成员
+
+    ```cpp
+      RdmaChannel* FindChannel(const string& key);
+      void SetupChannels();
+      const string& local_worker();
+    ```
+
+    RdmaMgr负责管理RdmaAdapter和众多RdmaChannel，RdmaMgr包含local_worker_（本机）名和远程节点的数量，ChannelTable用于存放所有与远程节点关联的RdmaChannel。FindChannel函数用于根据给定的名（key）在ChannelTable中查找相应的RdmaChannel，SetupChannels函数非常重要，这个函数会调用grpc_verbs_client.h中的GrpcVerbsClient类来实现RDMA的初始化，这也是“源码剖析中传”和“源码剖析前传”的衔接点。只有RdmaMgr完成了SetupChannels，本地节点上的RdmaChannels才拥有了远程节点的地址以及虚拟内存地址、key信息，才可以进行之后的消息、数据传输工作。
+
+    ```cpp
+    void RdmaMgr::SetupChannels() {
+      for (const auto& p : channel_table_) {
+        string worker_name = p.first;
+        RdmaChannel* rc = p.second;
+        GetRemoteAddressRequest req;
+        GetRemoteAddressResponse resp;
+        SharedGrpcChannelPtr client_channel =
+            channel_cache_->FindWorkerChannel(worker_name);
+        GrpcVerbsClient* client = new GrpcVerbsClient(client_channel);    
+        CHECK(client != nullptr) << "No worker known as " << worker_name;
+        // setting up request
+        req.set_host_name(local_worker_);
+        Channel* channel_info = req.mutable_channel();
+        channel_info->set_lid(rc->self_.lid);
+        ......
+        for (int i = 0; i < RdmaChannel::kNumMessageBuffers; i++) {
+          MemoryRegion* mr = req.add_mr();
+          mr->set_remote_addr(
+              reinterpret_cast<uint64_t>(rc->message_buffers_[i]->buffer_));
+          mr->set_rkey(rc->message_buffers_[i]->self_->rkey);
+        }
+        Status s = client->GetRemoteAddress(&req, &resp);
+        if (s.ok()) {
+          CHECK(worker_name.compare(resp.host_name()) == 0);
+          RdmaAddress ra;
+          ra.lid = resp.channel().lid();
+          ......
+          rc->SetRemoteAddress(ra, false);
+          rc->Connect();
+          int i = 0;
+          int idx[] = {1, 0, 3, 2};
+          for (const auto& mr : resp.mr()) {
+            RdmaBuffer* rb = rc->message_buffers_[idx[i]];
+            RemoteMR rmr;
+            rmr.remote_addr = mr.remote_addr();
+            rmr.rkey = mr.rkey();
+            rb->SetRemoteMR(rmr, false);
+            i++;
+          }
+          CHECK(i == RdmaChannel::kNumMessageBuffers);
+        } else {
+          LOG(ERROR) << s.error_message();
+        }
+        delete client;
+      }
+    }
+    ```
+
+
+
+## **rdma_rendezvous_mgr.h rdma_rendezvous_mgr.cc**
+
+- ### **class RdmaRendezvousMgr**
+
+  负责管理一组local rendezvous实例class RdmaRemoteRendezvous**
+
+- ### **class RdmaRemoteRendezvous**
+
+  - 数据成员
+
+    ```cpp
+    RdmaMgr* rdma_mgr_;
+    ```
+
+  - 函数成员
+
+    ```cpp
+    void RecvFromRemoteAsync(const Rendezvous::ParsedKey& parsed,
+                               const Rendezvous::Args& args,
+                               DoneCallback done) override;
+    ```
+
+    RdmaRemoteRendezvous是BaseRemoteRendezvous派生类，是recv算子的背后实现，RecvFromRemoteAsync函数定义了recv算子向send算子请求tensor的具体实现。首先验证请求的源和远程设备有效，然后根据远程设备名调用RdmaMgr的FindChannel获得相应的RdmaChannel，通过InsertRecvCallback为RdmaChannel设置相应的recv事件回调函数，回调函数主要就是接收tensor然后回复send端，告知send端已经收到tensor可以释放相应buffer了。在设置了回调函数后，就可以向send端发出tensor请求了——SendNextItem。具体的流程可以参照图2。
+
+    ```cpp
+    void RdmaRemoteRendezvous::RecvFromRemoteAsync(
+        const Rendezvous::ParsedKey& parsed, const Rendezvous::Args& recv_args,
+        DoneCallback done) {
+      Status s;
+      // parse src_name and dst_name
+      string src_name, dst_name, unused;
+      if (!DeviceNameUtils::SplitDeviceName(parsed.src_device, &src_name,
+                                            &unused)) {
+        s = errors::Internal("Could not parse src name.");
+      }
+      CHECK(s.ok()) << "s is not ok, error code " << s.error_message();
+      ......
+      if (!s.ok()) {
+        done(s, Args(), recv_args, Tensor{}, false);
+        return;
+      }
+      CHECK(dst_name.compare(rdma_mgr_->local_worker()) == 0);
+      RdmaChannel* rc = rdma_mgr_->FindChannel(src_name);
+      string key(std::move(parsed.FullKey().ToString()));
+      string key_with_step_id = VerbsUtil::AppendStepidToKey(key, step_id_);
+      // insert callback
+      rc->InsertRecvCallback(key_with_step_id, [this, key, key_with_step_id, rc,
+                                                recv_args, parsed, done]() {
+        Status s;
+        Device* src_dev;
+        s = env_->device_mgr->LookupDevice("CPU:0", &src_dev);
+        CHECK(s.ok()) << "s is not ok, error code " << s.error_message();
+        if (!s.ok()) {
+          done(s, Args(), recv_args, Tensor(), true);
+          return;
+        }
+        ......
+        RdmaBuffer* rb = rc->FindBuffer(key);
+        RdmaMessage rm;
+        CHECK(rb->size_ >= RdmaMessage::kMessageTotalBytes);
+        RdmaMessage::ParseMessage(rm, rb->buffer_);
+        CHECK(rm.type_ == RDMA_MESSAGE_TENSOR_WRITE);
+        Tensor val;
+        if (!rm.is_dead_) {
+          void* input = static_cast<char*>(rb->buffer_) +
+                        RdmaMessage::kTensorBufferStartIndex;
+          TensorProto proto;
+          CHECK(rm.tensor_bytes_ + RdmaMessage::kTensorBufferStartIndex <=
+                rb->size_);
+          CHECK(ParseProtoUnlimited(&proto, input, rm.tensor_bytes_))
+              << "fail to parse proto from array";
+          s = dst_dev->MakeTensorFromProto(proto, recv_args.alloc_attrs, &val);
+        }
+        rc->RemoveRecvCallback(key_with_step_id);
+        // create message
+        RdmaMessage br;
+        br.type_ = RDMA_MESSAGE_BUFFER_IDLE;
+        br.name_size_ = key.size();
+        br.name_ = key;
+        string message = RdmaMessage::CreateMessage(br);
+        RdmaBuffer* tb = rc->tx_message_buffer_;
+        tb->EnqueueItem(message);
+        tb->SendNextItem();
+        done(s, Args(), recv_args, val, rm.is_dead_);
+      });
+      // append key to message queue
+      RdmaBuffer* rb = rc->tx_message_buffer_;
+      RdmaMessage rm;
+      rm.type_ = RDMA_MESSAGE_TENSOR_REQUEST;
+      rm.name_size_ = key.size();
+      rm.name_ = key;
+      rm.step_id_ = step_id_;
+      string message = RdmaMessage::CreateMessage(rm);
+      rb->EnqueueItem(message);
+      rb->SendNextItem();
+    }
+    ```
+
+    ​
+
